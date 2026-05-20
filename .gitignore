@@ -1,0 +1,22 @@
+# Go
+gateway/bin/
+*.exe
+
+# Python
+worker/__pycache__/
+worker/.venv/
+*.pyc
+*.pyo
+.env
+
+# Node
+frontend/node_modules/
+frontend/.next/
+frontend/dist/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
