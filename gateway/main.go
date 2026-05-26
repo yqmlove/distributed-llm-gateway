@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -13,11 +15,16 @@ import (
 var rdb *redis.Client
 
 func main() {
-	rdb = redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
+	rdb = redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 
 	r := gin.Default()
+	r.Use(cors.New(cors.Config{
+		AllowOrigins: []string{"http://localhost:5173"},
+		AllowMethods: []string{"POST", "GET"},
+		AllowHeaders: []string{"Content-Type"},
+	}))
+
+	r.OPTIONS("/chat", func(c *gin.Context) { c.Status(200) })
 	r.POST("/chat", handleChat)
 	r.Run(":8080")
 }
@@ -26,23 +33,18 @@ func handleChat(c *gin.Context) {
 	var body struct {
 		Message string `json:"message"`
 	}
-
 	if err := c.ShouldBindJSON(&body); err != nil || body.Message == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "message is required"})
 		return
 	}
 
-	// create unique id
 	requestID := uuid.New().String()
-
-	// subscribe the channel and wait for the reply from Worker
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	pubsub := rdb.Subscribe(ctx, "response:"+requestID)
 	defer pubsub.Close()
 
-	// write message to Redis Stream，attach request_id
 	rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: "llm_requests",
 		Values: map[string]interface{}{
@@ -51,12 +53,23 @@ func handleChat(c *gin.Context) {
 		},
 	})
 
-	// waiting for Worker result （maximum 60 second）
-	msg, err := pubsub.ReceiveMessage(ctx)
-	if err != nil {
-		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "timeout waiting for response"})
-		return
-	}
+	// Set SSE headers
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
 
-	c.JSON(http.StatusOK, gin.H{"reply": msg.Payload})
+	// Stream tokens to the client
+	for {
+		msg, err := pubsub.ReceiveMessage(ctx)
+		if err != nil {
+			break
+		}
+		if msg.Payload == "[DONE]" {
+			fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+			c.Writer.Flush()
+			break
+		}
+		fmt.Fprintf(c.Writer, "data: %s\n\n", msg.Payload)
+		c.Writer.Flush()
+	}
 }

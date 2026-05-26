@@ -22,14 +22,21 @@ while True:
             request_id = data["request_id"]
             print(f"Received: {message}")
 
-            response = client.chat.completions.create(
+            # Stream tokens one by one
+            stream_response = client.chat.completions.create(
                 model="llama3.2",
                 messages=[{"role": "user", "content": message}],
                 max_tokens=200,
+                stream=True,        # NEW: enable streaming
             )
 
-            reply = response.choices[0].message.content
-            print(f"Reply: {reply}")
+            for chunk in stream_response:
+                token = chunk.choices[0].delta.content
+                if token:
+                    print(token, end="", flush=True)
+                    # Publish each token to the channel
+                    rdb.publish("response:" + request_id, token)
 
-            # publish the message to the channel
-            rdb.publish("response:" + request_id, reply)
+            # Send a special marker so the Gateway knows the stream is done
+            rdb.publish("response:" + request_id, "[DONE]")
+            print()
