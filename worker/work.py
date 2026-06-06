@@ -1,27 +1,55 @@
-import os
+import structlog
 import redis
 from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# Configure structlog to output JSON
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer(),
+    ]
+)
+log = structlog.get_logger()
+
+# Point to local Ollama instead of OpenAI
 client = OpenAI(
     api_key="ollama",
     base_url="http://localhost:11434/v1"
 )
 rdb = redis.Redis(host="localhost", port=6379, decode_responses=True)
 
-print("Worker started, waiting for messages...")
+STREAM = "llm_requests"
+GROUP  = "workers"
+WORKER = "worker-1"
+
+# Create consumer group if it does not exist
+# "0" means the group will read from the very beginning of the stream
+try:
+    rdb.xgroup_create(STREAM, GROUP, id="$", mkstream=True)
+    log.info("consumer group created", group=GROUP)
+except Exception:
+    log.info("consumer group already exists", group=GROUP)
+
+log.info("worker started", stream=STREAM, group=GROUP)
 
 while True:
-    # Block until a message arrives in the stream
-    results = rdb.xread({"llm_requests": "$"}, block=0, count=1)
+    # Read one message assigned to this worker; block until one arrives
+    results = rdb.xreadgroup(GROUP, WORKER, {STREAM: ">"}, count=1, block=0)
+
+    if not results:
+        continue
 
     for stream, messages in results:
         for msg_id, data in messages:
-            message = data["message"]
+            message    = data["message"]
             request_id = data["request_id"]
-            print(f"[{request_id}] received: {message}")
+
+            log.info("request received",
+                     request_id=request_id,
+                     message=message)
 
             # Enable streaming so tokens are returned one by one
             stream_response = client.chat.completions.create(
@@ -41,4 +69,9 @@ while True:
 
             # Send the end marker so the Gateway knows the stream is finished
             rdb.publish("response:" + request_id, "[DONE]")
-            print(f"[{request_id}] stream complete, tokens sent: {token_count}")
+            log.info("stream complete",
+                     request_id=request_id,
+                     tokens_sent=token_count)
+
+            # Acknowledge the message so Redis removes it from the pending list
+            rdb.xack(STREAM, GROUP, msg_id)
